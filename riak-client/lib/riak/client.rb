@@ -14,6 +14,7 @@
 require 'riak'
 require 'tempfile'
 require 'delegate'
+require 'riak/failed_request'
 
 module Riak
   # A client connection to Riak.
@@ -27,11 +28,22 @@ module Riak
     autoload :CurbBackend,    "riak/client/curb_backend"
     autoload :ExconBackend,   "riak/client/excon_backend"
 
+    autoload :ProtobuffsBackend, "riak/client/protobuffs_backend"
+    autoload :BeefcakeProtobuffsBackend, "riak/client/beefcake_protobuffs_backend"
+
     # When using integer client IDs, the exclusive upper-bound of valid values.
     MAX_CLIENT_ID = 4294967296
 
+    # Array of valid protocols
+    PROTOCOLS = %w[http https pbc]
+
     # Regexp for validating hostnames, lifted from uri.rb in Ruby 1.8.6
     HOST_REGEX = /^(?:(?:(?:[a-zA-Z\d](?:[-a-zA-Z\d]*[a-zA-Z\d])?)\.)*(?:[a-zA-Z](?:[-a-zA-Z\d]*[a-zA-Z\d])?)\.?|\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|\[(?:(?:[a-fA-F\d]{1,4}:)*(?:[a-fA-F\d]{1,4}|\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})|(?:(?:[a-fA-F\d]{1,4}:)*[a-fA-F\d]{1,4})?::(?:(?:[a-fA-F\d]{1,4}:)*(?:[a-fA-F\d]{1,4}|\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}))?)\])$/n
+
+    VALID_OPTIONS = [:protocol, :host, :port, :prefix, :client_id, :mapred, :luwak, :http_backend, :protobuffs_backend, :ssl, :basic_auth]
+
+    # @return [String] The protocol to use for the Riak endpoint
+    attr_reader :protocol
 
     # @return [String] The host or IP address for the Riak endpoint
     attr_reader :host
@@ -39,8 +51,17 @@ module Riak
     # @return [Fixnum] The port of the Riak HTTP endpoint
     attr_reader :port
 
+    # @return [String] The user:pass for http basic authentication
+    attr_reader :basic_auth
+
     # @return [String] The internal client ID used by Riak to route responses
     attr_reader :client_id
+
+    # @return [Hash|nil] The SSL options that get built when using SSL
+    attr_reader :ssl_options
+
+    # @return [Hash|nil] The writer that will build valid SSL options from the provided config
+    attr_writer :ssl
 
     # @return [String] The URL path prefix to the "raw" HTTP endpoint
     attr_accessor :prefix
@@ -54,6 +75,9 @@ module Riak
     # @return [Symbol] The HTTP backend/client to use
     attr_accessor :http_backend
 
+    # @return [Symbol] The Protocol Buffers backend/client to use
+    attr_accessor :protobuffs_backend
+
     # Creates a client connection to Riak
     # @param [Hash] options configuration options for the client
     # @option options [String] :host ('127.0.0.1') The host or IP address for the Riak endpoint
@@ -62,19 +86,23 @@ module Riak
     # @option options [String] :mapred ('/mapred') The path to the map-reduce HTTP endpoint
     # @option options [Fixnum, String] :client_id (rand(MAX_CLIENT_ID)) The internal client ID used by Riak to route responses
     # @option options [String, Symbol] :http_backend (:NetHTTP) which  HTTP backend to use
-    # @raise [ArgumentError] raised if any options are invalid
+    # @option options [String, Symbol] :protobuffs_backend (:Beefcake) which Protocol Buffers backend to use
+    # @raise [ArgumentError] raised if any invalid options are given
     def initialize(options={})
-      unless (options.keys - [:host, :port, :prefix, :client_id, :mapred, :luwak, :http_backend]).empty?
-        raise ArgumentError, "invalid options"
+      unless (options.keys - VALID_OPTIONS).empty?
+        raise ArgumentError, t("invalid options")
       end
+      self.ssl          = options[:ssl]
+      self.protocol     = options[:protocol]     || "http"
       self.host         = options[:host]         || "127.0.0.1"
-      self.port         = options[:port]         || 8098
+      self.port         = options[:port]         || ((protocol == "pbc") ? 8087 : 8098)
       self.client_id    = options[:client_id]    || make_client_id
       self.prefix       = options[:prefix]       || "/riak/"
       self.mapred       = options[:mapred]       || "/mapred"
       self.luwak        = options[:luwak]        || "/luwak"
       self.http_backend = options[:http_backend] || :NetHTTP
-      raise ArgumentError, t("missing_host_and_port") unless @host && @port
+      self.protobuffs_backend = options[:protobuffs_backend] || :Beefcake
+      self.basic_auth   = options[:basic_auth] if options[:basic_auth]
     end
 
     # Set the client ID for this client. Must be a string or Fixnum value 0 =< value < MAX_CLIENT_ID.
@@ -90,6 +118,19 @@ module Riak
                    else
                      raise ArgumentError, t("invalid_client_id", :max_id => MAX_CLIENT_ID)
                    end
+    end
+
+    # Set the protocol of the Riak endpoint.  Value must be in the
+    # Riak::Client::PROTOCOLS array.
+    # @raise [ArgumentError] if the protocol is not in PROTOCOLS
+    # @return [String] the protocol being assigned
+    def protocol=(value)
+      unless PROTOCOLS.include?(value.to_s)
+        raise ArgumentError, t("protocol_invalid", :invalid => value, :valid => PROTOCOLS.join(', '))
+      end
+      @ssl_options ||= {} if value === 'https'
+      @backend = nil
+      @protocol = value
     end
 
     # Set the hostname of the Riak endpoint. Must be an IPv4, IPv6, or valid hostname
@@ -110,10 +151,32 @@ module Riak
       @port = value
     end
 
+    def basic_auth=(value)
+      raise ArgumentError, t("invalid_basic_auth") unless value.to_s.split(':').length === 2
+      @basic_auth = value
+    end
+
     # Sets the desired HTTP backend
     def http_backend=(value)
-      @http = nil
+      @http, @backend = nil, nil
       @http_backend = value
+    end
+
+    # Sets the desired Protocol Buffers backend
+    def protobuffs_backend=(value)
+      @protobuffs, @backend = nil, nil
+      @protobuffs_backend = value
+    end
+
+    # Enables or disables SSL on the client to be utilized by the HTTP Backends
+    def ssl=(value)
+      @ssl_options = Hash === value ? value : {}
+      value ? ssl_enable : ssl_disable
+    end
+
+    # Checks if the current protocol is https
+    def ssl_enabled?
+      protocol === 'https'
     end
 
     # Automatically detects and returns an appropriate HTTP backend.
@@ -131,7 +194,41 @@ module Riak
                 end
     end
 
-    alias :backend :http
+    # Automatically detects and returns an appropriate Protocol
+    # Buffers backend.  The Protocol Buffers backend is used
+    # internally by the Riak client but can also be used to access the
+    # server directly.
+    # @return [ProtobuffsBackend] the Protocol Buffers backend for
+    #    this client
+    def protobuffs
+      @protobuffs ||= begin
+                        klass = self.class.const_get("#{@protobuffs_backend}ProtobuffsBackend")
+                        if klass.configured?
+                          klass.new(self)
+                        else
+                          raise t('protobuffs_configuration', :backend => @protobuffs_backend)
+                        end
+                      end
+    end
+
+    # Returns a backend for operations that are protocol-independent.
+    # You can change which type of backend is used by setting the
+    # {#protocol}.
+    # @return [HTTPBackend,ProtobuffsBackend] an appropriate client backend
+    def backend
+      @backend ||= case @protocol.to_s
+                   when /https?/i
+                     http
+                   when /pbc/i
+                     protobuffs
+                   end
+    end
+
+    # Pings the Riak server to check for liveness.
+    # @return [true,false] whether the Riak server is alive and reachable
+    def ping
+      backend.ping
+    end
 
     # Retrieves a bucket from Riak.
     # @param [String] bucket the bucket to retrieve
@@ -229,7 +326,7 @@ module Riak
 
     # @return [String] A representation suitable for IRB and debugging output.
     def inspect
-      "#<Riak::Client #{http.root_uri.to_s}>"
+      "#<Riak::Client #{protocol}://#{host}:#{port}>"
     end
 
     private
@@ -239,6 +336,21 @@ module Riak
 
     def b64encode(n)
       Base64.encode64([n].pack("N")).chomp
+    end
+
+    def ssl_enable
+      self.protocol = 'https'
+      @ssl_options[:pem] = File.read(@ssl_options[:pem_file]) if @ssl_options[:pem_file]
+      @ssl_options[:verify_mode] ||= "peer" if @ssl_options.stringify_keys.any? {|k,v| %w[pem ca_file ca_path].include?(k)}
+      @ssl_options[:verify_mode] ||= "none"
+      raise ArgumentError.new unless %w[none peer].include?(@ssl_options[:verify_mode])
+
+      @ssl_options
+    end
+
+    def ssl_disable
+      self.protocol = 'http'
+      @ssl_options  = nil
     end
 
     # @private

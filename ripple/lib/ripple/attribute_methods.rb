@@ -33,6 +33,8 @@ module Ripple
       include Query
       include Dirty
       include ActiveModel::MassAssignmentSecurity
+      
+      attr_protected :key
     end
 
     module ClassMethods

@@ -31,6 +31,8 @@ module Riak
 
       private
       def perform(method, uri, headers, expect, data=nil, &block)
+        configure_ssl if @client.ssl_enabled?
+
         params = {
           :method => method.to_s.upcase,
           :headers => RequestHeaders.new(headers).to_hash,
@@ -51,12 +53,17 @@ module Riak
           end
           result
         else
-          raise FailedRequest.new(method, expect, response.status, response.headers, response.body)
+          raise HTTPFailedRequest.new(method, expect, response.status, response.headers, response.body)
         end
       end
 
       def connection
         @connection ||= Excon::Connection.new(root_uri.to_s)
+      end
+
+      def configure_ssl
+        Excon.ssl_verify_peer = @client.ssl_options[:verify_mode].to_s === "peer"
+        Excon.ssl_ca_path     = @client.ssl_options[:ca_path] if @client.ssl_options[:ca_path]
       end
     end
   end
